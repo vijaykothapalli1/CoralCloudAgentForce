@@ -1,0 +1,231 @@
+# Unique name for this workflow
+name: Packaging
+
+# Workflow starts when receiving custom event sent by CI workflow or manually
+on:
+    workflow_dispatch:
+        inputs:
+            isBasePackageRelease:
+                description: 'Package base app?'
+                required: false
+                type: boolean
+            isSitePackageRelease:
+                description: 'Package site?'
+                required: false
+                type: boolean
+    repository_dispatch:
+        types: [start-packaging]
+
+# Workflow environment variables
+env:
+    # Should the base package be released
+    IS_BASE_PACKAGE_RELEASE: ${{ github.event.client_payload.isBasePackageRelease == 'true' || inputs.isBasePackageRelease }}
+    # Should the site package be released
+    IS_SITE_PACKAGE_RELEASE: ${{ github.event.client_payload.isSitePackageRelease == 'true' || inputs.isSitePackageRelease }}
+
+# Jobs to be executed
+jobs:
+    release-package-version:
+        runs-on: trailheadapps-Ubuntu
+        steps:
+            # Install Salesforce CLI
+            - name: 'Install Salesforce CLI'
+              run: |
+                  npm install @salesforce/cli --location=global
+                  nodeInstallPath=$(npm config get prefix)
+                  echo "$nodeInstallPath/bin" >> $GITHUB_PATH
+                  sf --version
+
+            # Checkout the source code
+            - name: 'Checkout source code'
+              uses: actions/checkout@v4
+              with:
+                  ref: ${{ github.event.client_payload.ref }}
+
+            # Store secret for dev hub
+            - name: 'Populate auth file with DEVHUB_SFDX_URL secret'
+              shell: bash
+              run: |
+                  echo ${{ secrets.DEVHUB_SFDX_URL }} > ./DEVHUB_SFDX_URL.txt
+                  secretFileSize=$(wc -c "./DEVHUB_SFDX_URL.txt" | awk '{print $1}')
+                  if [ $secretFileSize == 1 ]; then
+                      echo "Missing DEVHUB_SFDX_URL secret. Is this workflow running on a fork?";
+                      exit 1;
+                  fi
+
+            # Authenticate dev hub
+            - name: 'Authenticate Dev Hub'
+              run: sf org login sfdx-url -f ./DEVHUB_SFDX_URL.txt -a devhub -d
+
+            # Remove auth file
+            - name: 'Remove auth file'
+              run: rm -f ./DEVHUB_SFDX_URL.txt
+
+            # Modify local metadata for packaging
+            - name: 'Modify local metadata for packaging'
+              run: |
+                  cp -rpv cc-service-app/main/default/corsWhitelistOrigins cc-base-app/main/default/
+                  cp -rpv cc-service-app/main/default/cspTrustedSites cc-base-app/main/default/
+                  cp -rpv cc-service-app/main/default/flows/* cc-base-app/main/default/flows/
+                  rm -f cc-base-app/main/default/flows/Route_to_Agent.flow-meta.xml
+                  sed '/<actionCalls>/,/<\/actionCalls>/d' cc-base-app/main/default/flows/PersonalizedSchedule.flow-meta.xml > cc-base-app/main/default/flows/PersonalizedSchedule_Temp.flow-meta.xml && mv cc-base-app/main/default/flows/PersonalizedSchedule_Temp.flow-meta.xml cc-base-app/main/default/flows/PersonalizedSchedule.flow-meta.xml
+                  sed '/<actionCalls>/,/<\/actionCalls>/d' cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml > cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml && mv cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml
+                  sed '/<recordUpdates>/,/<\/recordUpdates>/d' cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml > cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml && mv cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml
+                  awk '/<connector>/ {c=1; buffer=$0; next} c { buffer = buffer ORS $0; if (/<targetReference>Update_Messaging_Session<\/targetReference>/) found=1; if (/<\/connector>/) { if (found) { c=0; found=0; next } else print buffer; c=0; } next } {print}' cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml > cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml && mv cc-base-app/main/default/flows/Route_to_Queue_Temp.flow-meta.xml cc-base-app/main/default/flows/Route_to_Queue.flow-meta.xml
+
+            # Bump base package minor version
+            - name: 'Bump base package minor version'
+              if: ${{ env.IS_BASE_PACKAGE_RELEASE }}
+              run: node bin/packaging/bump-package-minor-version.js "Coral Cloud - Base"
+
+            # Bump site package minor version
+            - name: 'Bump site package minor version'
+              if: ${{ env.IS_SITE_PACKAGE_RELEASE }}
+              run: node bin/packaging/bump-package-minor-version.js "Coral Cloud - Site"
+
+            # Bump site package dependencies
+            - name: 'Bump site package dependencies'
+              if: ${{ env.IS_SITE_PACKAGE_RELEASE }}
+              run: node bin/packaging/bump-package-dependencies.js "Coral Cloud - Site"
+
+            # Create base package version
+            - name: 'Create base package version'
+              if: ${{ env.IS_BASE_PACKAGE_RELEASE }}
+              run: |
+                  set +e
+                  json=$(sf package version create -p "Coral Cloud - Base" -c -x -w 60 --json)
+                  echo $json
+                  status=$(echo $json | jq '.status')
+                  if [ $status == "0" ]; then
+                      packageVersionId=$(echo $json | jq -r '.result.SubscriberPackageVersionId')
+                      echo "BASE_PACKAGE_VERSION_ID=$packageVersionId" >> $GITHUB_ENV
+                  else
+                      echo "Failed to create package version"
+                  fi
+                  exit $status
+
+            # Create site package version
+            - name: 'Create site package version'
+              if: ${{ env.IS_SITE_PACKAGE_RELEASE }}
+              run: |
+                  set +e
+                  json=$(sf package version create -p "Coral Cloud - Site" -c -x -w 60 --json)
+                  echo $json
+                  status=$(echo $json | jq '.status')
+                  if [ $status == "0" ]; then
+                      packageVersionId=$(echo $json | jq -r '.result.SubscriberPackageVersionId')
+                      echo "SITE_PACKAGE_VERSION_ID=$packageVersionId" >> $GITHUB_ENV
+                  else
+                      echo "Failed to create package version"
+                  fi
+                  exit $status
+
+            # Wait for package replication
+            - name: 'Wait for package replication (360s)'
+              run: sleep 360s
+
+            # Get latest base package version
+            - name: 'Get latest base package version'
+              if: ${{ !env.IS_BASE_PACKAGE_RELEASE }}
+              run: |
+                  set +e
+                  json=$(sf package version list -r -o MajorVersion,MinorVersion,PatchVersion -p "Coral Cloud - Base" --json)
+                  echo $json
+                  status=$(echo $json | jq '.status')
+                  if [ $status == "0" ]; then
+                      packageVersionId=$(echo $json | jq -r '.result[-1].SubscriberPackageVersionId')
+                      echo "BASE_PACKAGE_VERSION_ID=$packageVersionId" >> $GITHUB_ENV
+                  else
+                      echo "Failed to read package versions"
+                  fi
+                  exit $status
+
+            # Get latest site package version
+            - name: 'Get latest site package version'
+              if: ${{ !env.IS_SITE_PACKAGE_RELEASE }}
+              run: |
+                  set +e
+                  json=$(sf package version list -r -o MajorVersion,MinorVersion,PatchVersion -p "Coral Cloud - Site" --json)
+                  echo $json
+                  status=$(echo $json | jq '.status')
+                  if [ $status == "0" ]; then
+                      packageVersionId=$(echo $json | jq -r '.result[-1].SubscriberPackageVersionId')
+                      echo "SITE_PACKAGE_VERSION_ID=$packageVersionId" >> $GITHUB_ENV
+                  else
+                      echo "Failed to read package versions"
+                  fi
+                  exit $status
+
+            # Create scratch org
+            - name: 'Create scratch org'
+              run: sf org create scratch -f config/cc-base-project-scratch-def.json -a scratch-org -d -y 1
+
+            # Install base package in scratch org
+            - name: 'Install base package in scratch org'
+              run: sf package install -p ${{ env.BASE_PACKAGE_VERSION_ID }} -w 10 -o scratch-org -r
+
+            # Install site package in scratch org
+            - name: 'Install site package in scratch org'
+              run: sf package install -p ${{ env.SITE_PACKAGE_VERSION_ID }} -w 10 -o scratch-org -r
+
+            # Promote base package version
+            - name: 'Promote base package version'
+              if: ${{ env.IS_BASE_PACKAGE_RELEASE }}
+              run: sf package version promote -p ${{ env.BASE_PACKAGE_VERSION_ID }} -n
+
+            # Promote site package version
+            - name: 'Promote site package version'
+              if: ${{ env.IS_SITE_PACKAGE_RELEASE }}
+              run: sf package version promote -p ${{ env.SITE_PACKAGE_VERSION_ID }} -n
+
+            # Prepare PR title and body
+            - name: 'Prepare PR title and body'
+              id: prepare-pr
+              run: |
+                  title="Released new package version(s):"
+                  body="Released new package version(s):<br/>"
+                  if [ ${{ env.IS_BASE_PACKAGE_RELEASE }} ]; then
+                    title="$title Base"
+                    body="$body- Base: \`${{ env.BASE_PACKAGE_VERSION_ID }}\`<br/>"
+                  fi
+                  if [ ${{ env.IS_SITE_PACKAGE_RELEASE }} ]; then
+                    body="$body- Site: \`${{ env.SITE_PACKAGE_VERSION_ID }}\`"
+                    if [ ${{ env.IS_BASE_PACKAGE_RELEASE }} ]; then
+                      title="$title, Site"
+                    else
+                      title="$title Site"
+                    fi
+                  fi
+                  echo "title=$title" >> $GITHUB_OUTPUT
+                  echo "body=$body" >> $GITHUB_OUTPUT
+
+            # Create PR for new package versions
+            - name: 'Create PR for new package versions'
+              id: create-pr
+              uses: peter-evans/create-pull-request@v6
+              with:
+                  title: ${{ steps.prepare-pr.outputs.title }}
+                  body: ${{ steps.prepare-pr.outputs.body }}
+                  author: github-actions[bot] <41898282+github-actions[bot]@users.noreply.github.com>
+                  commit-message: ${{ steps.prepare-pr.outputs.body }}
+                  branch: 'auto/release-package-version'
+                  token: ${{ secrets.BOT_ACCESS_TOKEN }}
+
+            # Wait for PR to stabilize (auto skip CI)
+            - name: 'Wait for PR to stabilize (60s)'
+              run: sleep 60s
+
+            # Approve and mark PR for auto merge
+            - name: 'Approve and mark PR for auto merge'
+              continue-on-error: true
+              run: |
+                  gh pr review --approve "$PR_NUMBER"
+                  gh pr merge --auto --squash "$PR_NUMBER"
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  PR_NUMBER: ${{ steps.create-pr.outputs.pull-request-number }}
+
+            # Housekeeping
+            - name: 'Delete scratch org'
+              if: always()
+              run: sf org delete scratch -p -o scratch-org
